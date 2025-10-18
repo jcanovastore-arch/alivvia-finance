@@ -3,6 +3,23 @@
 # Stack: Streamlit + PostgreSQL (Supabase) via SQLAlchemy
 # Observação: exportação é sempre OPCIONAL e reflete o filtro atual na tela.
 
+# --- bootstrap: instala libs em runtime se necessário (para Streamlit Cloud) ---
+try:
+    import sqlalchemy  # noqa: F401
+except ModuleNotFoundError:
+    import sys, subprocess
+    pkgs = [
+        "SQLAlchemy==2.0.31",
+        "pandas==2.2.2",
+        "numpy==1.26.4",
+        "psycopg2-binary==2.9.9",
+        "openpyxl==3.1.5",
+    ]
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs])
+
+from sqlalchemy import create_engine, text
+
+
 import os
 import io
 import hashlib

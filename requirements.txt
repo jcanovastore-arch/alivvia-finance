@@ -1,4 +1,4 @@
-﻿# v0.2.7b
+﻿# v0.2.7d
 streamlit==1.38.0
 pandas==2.2.2
 numpy==1.26.4
