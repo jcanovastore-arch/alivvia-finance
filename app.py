@@ -29,8 +29,6 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import numpy as np
 import streamlit as st
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
 
 # =========================
 # Configuração básica
