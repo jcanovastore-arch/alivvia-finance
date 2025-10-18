@@ -1,818 +1,716 @@
-# Alivvia Gestão - app.py (COMPLETO)
-# Autor: Paulo Piva + ChatGPT
-# Objetivo: Sistema financeiro simples (Importar → Lançamentos → Conciliação → Relatórios) com persistência local.
-# Rodar: streamlit run app.py
-# Dependências: streamlit, pandas, numpy, openpyxl (para .xlsx)
+# Alivvia Gestão – app.py
+# Versão: v0.2.7
+# Stack: Streamlit + PostgreSQL (Supabase) via SQLAlchemy
+# Observação: exportação é sempre OPCIONAL e reflete o filtro atual na tela.
 
-import streamlit as st
+import os
+import io
+import hashlib
+import datetime as dt
+from typing import Dict, List, Tuple
+
 import pandas as pd
 import numpy as np
-import json
-import hashlib
-from datetime import datetime, date
-from pathlib import Path
-import uuid
-import re
+import streamlit as st
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
-# ==============================
-# Config & Constantes
-# ==============================
+# =========================
+# Configuração básica
+# =========================
+APP_VERSION = "v0.2.7"
+st.set_page_config(page_title=f"Alivvia Gestão {APP_VERSION}", layout="wide")
 
-st.set_page_config(page_title="Alivvia Gestão", layout="wide")
+# Secrets (Streamlit Cloud ou .streamlit/secrets.toml)
+DATABASE_URL = st.secrets["DATABASE_URL"]
+APP_SECRET = st.secrets.get("APP_SECRET", "alivvia-local-secret")
+DEFAULT_TOLERANCIA = 0.10  # R$ 0,10 (podemos mover para tabela/Config depois)
 
-DATA_DIR = Path("./data")
-DATA_DIR.mkdir(exist_ok=True)
+# =========================
+# Conexão DB
+# =========================
+@st.cache_resource(show_spinner=False)
+def get_engine() -> Engine:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    return engine
 
-TX_FILE = DATA_DIR / "transactions.csv"         # base principal (extrato + lançamentos + status de conciliação)
-RULES_FILE = DATA_DIR / "rules.json"            # regras automáticas (aprendizado)
-CATS_FILE = DATA_DIR / "categories.json"        # categorias
-SUPP_FILE = DATA_DIR / "suppliers.json"         # fornecedores
+engine = get_engine()
 
-TOLERANCIA_MATCH = 0.10  # R$ 0,10 (informativa por enquanto)
+# =========================
+# Utilitários
+# =========================
+def sha1_row(values: List[str]) -> str:
+    """Gera hash estável para idempotência (importação)."""
+    m = hashlib.sha1()
+    for v in values:
+        m.update((str(v) if v is not None else "").encode("utf-8"))
+        m.update(b"|")
+    return m.hexdigest()
 
-# Cores por empresa
-COMPANY_COLORS = {
-    "Alivvia": "#15A34A",  # verde
-    "JCA": "#7C3AED"       # roxo
-}
-
-# Categorias base (DRE)
-DEFAULT_CATEGORIES = [
-    "Receita > Vendas (repasse marketplace)",
-    "Receita > Estorno/Devolução",
-    "Deduções > Taxas/Chargebacks (marketplace)",
-    "Custo > Frete",
-    "Custo > Embalagens/Envio",
-    "Custo > Aquisição/Fornecedores",
-    "Despesas > Marketing",
-    "Despesas > Salários/Encargos",
-    "Despesas > Aluguel",
-    "Despesas > Utilidades",
-    "Despesas > Administrativas",
-    "Despesas > Impostos/Taxas",
-    "Despesas > Tarifas bancárias",
-    "Financeiro > Juros/Multas",
-    "Investimento > Imobilizado/Equipamentos",
-    "Transferência intra-grupo",
-    "Retirada Social",
-    "Outros"
-]
-
-# Regras de auto-classificação (descricao + doc)
-DEFAULT_RULES = [
-    # ENTRADAS (repasse marketplace)
-    {"contains": ["entrada de dinheiro", "pix recebido", "pix credito", "qrcode pix", "pix mercado"],
-     "in_doc": [], "category": "Receita > Vendas (repasse marketplace)", "supplier": ""},
-    # DEVOLUÇÕES
-    {"contains": ["estorno", "reembolso", "devolu"], "in_doc": [],
-     "category": "Receita > Estorno/Devolução", "supplier": ""},
-    # TARIFAS/CHARGEBACKS (auto: não exige match)
-    {"contains": ["tarifa", "iof", "chargeback", "debito"], "in_doc": [],
-     "category": "Deduções > Taxas/Chargebacks (marketplace)", "supplier": ""},
-    {"contains": ["tarifa", "iof", "taxa"], "in_doc": [],
-     "category": "Despesas > Tarifas bancárias", "supplier": ""},
-    # FRETE
-    {"contains": ["jadlog", "correios", "total express"], "in_doc": [],
-     "category": "Custo > Frete", "supplier": ""},
-    # FORNECEDOR
-    {"contains": ["thor", "fornecedor"], "in_doc": [],
-     "category": "Custo > Aquisição/Fornecedores", "supplier": "Thor"},
-]
-
-# Campos padrão do modelo interno
-TX_COLUMNS = [
-    "tx_id", "empresa", "conta", "data", "descricao", "doc", "valor", "saldo",
-    "categoria", "fornecedor", "nf", "parcela", "datas_livres", "status_match",
-    "origem", "created_at", "updated_at"
-]
-
-# ==============================
-# Helpers de Persistência
-# ==============================
-
-def load_transactions():
-    if TX_FILE.exists():
-        df = pd.read_csv(TX_FILE, dtype=str)
-        # normalizações de tipos
-        for col in ["valor", "saldo"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        if "data" in df.columns:
-            df["data"] = pd.to_datetime(df["data"], errors="coerce").dt.date
-        # listas serializadas (datas_livres)
-        if "datas_livres" in df.columns:
-            df["datas_livres"] = df["datas_livres"].apply(lambda x: json.loads(x) if isinstance(x, str) and x.startswith("[") else [])
-        # garantir colunas
-        missing = [c for c in TX_COLUMNS if c not in df.columns]
-        for c in missing:
-            if c in ["valor", "saldo"]:
-                df[c] = 0.0
-            elif c == "datas_livres":
-                df[c] = [[] for _ in range(len(df))]
-            else:
-                df[c] = ""
-        return df[TX_COLUMNS]
-    else:
-        return pd.DataFrame(columns=TX_COLUMNS)
-
-def save_transactions(df: pd.DataFrame):
-    df = df.copy()
-    if "datas_livres" in df.columns:
-        df["datas_livres"] = df["datas_livres"].apply(lambda x: json.dumps(x if isinstance(x, list) else []))
-    df.to_csv(TX_FILE, index=False)
-
-def load_json(path: Path, default):
-    if path.exists():
+def to_date(x):
+    if pd.isna(x) or x == "":
+        return None
+    if isinstance(x, (dt.date, dt.datetime)):
+        return x.date() if isinstance(x, dt.datetime) else x
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y"):
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return dt.datetime.strptime(str(x), fmt).date()
         except Exception:
-            return default
-    return default
+            continue
+    return None
 
-def save_json(path: Path, obj):
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+def to_decimal(x):
+    if pd.isna(x) or x == "":
+        return None
+    try:
+        if isinstance(x, str):
+            x = x.replace(".", "").replace(",", ".")
+        return round(float(x), 2)
+    except Exception:
+        return None
 
-def load_rules():
-    rules = load_json(RULES_FILE, DEFAULT_RULES)
-    for r in rules:
-        r.setdefault("contains", [])
-        r.setdefault("in_doc", [])
-        r.setdefault("category", "")
-        r.setdefault("supplier", "")
-    return rules
+@st.cache_data(show_spinner=False)
+def load_dim_tables() -> Dict[str, pd.DataFrame]:
+    with engine.begin() as con:
+        companies = pd.read_sql("select id, name, color from companies order by name", con)
+        accounts  = pd.read_sql("""
+            select a.id, a.name, a.company_id, c.name as company, c.color
+            from bank_accounts a
+            join companies c on c.id=a.company_id
+            order by c.name, a.name
+        """, con)
+        cats = pd.read_sql("select id, name from categories where is_active=true order by name", con)
+        sups = pd.read_sql("select id, name from suppliers where is_active=true order by name", con)
+        rules = pd.read_sql("select id, token, category_id, supplier_id from rules", con)
+    return {"companies": companies, "accounts": accounts, "categories": cats,
+            "suppliers": sups, "rules": rules}
 
-def load_categories():
-    cats = load_json(CATS_FILE, DEFAULT_CATEGORIES)
-    return sorted(list(dict.fromkeys(cats)))
+def refresh_dims():
+    load_dim_tables.clear()
 
-def load_suppliers():
-    sups = load_json(SUPP_FILE, ["", "Thor"])
-    return sorted(list(dict.fromkeys(sups)))
+def color_pill(company_name: str, color_hex: str):
+    st.markdown(
+        f"""<div style="display:inline-block;padding:4px 10px;border-radius:12px;background:{color_hex};color:#fff;font-weight:600">
+        {company_name}
+        </div>""",
+        unsafe_allow_html=True
+    )
 
-# ==============================
-# Classificação automática
-# ==============================
+# =========================
+# Auto-classificação (regras)
+# =========================
+def suggest_category_supplier(desc: str, doc: str, rules_df: pd.DataFrame) -> Tuple[str, str]:
+    if rules_df is None or rules_df.empty:
+        return (None, None)
+    text = f"{desc or ''} {doc or ''}".lower()
+    hit = None
+    for _, r in rules_df.iterrows():
+        token = str(r["token"]).lower().strip()
+        if token and token in text:
+            hit = r
+            break
+    if hit is None:
+        return (None, None)
+    return (hit.get("category_id"), hit.get("supplier_id"))
 
-AUTO_NO_MATCH_CATS = {
-    "Deduções > Taxas/Chargebacks (marketplace)",
-    "Despesas > Tarifas bancárias"
+# =========================
+# Preset de mapeamento - Mercado Pago
+# =========================
+MP_MAP = {
+    "RELEASE_DATE": "date",
+    "TRANSACTION_TYPE": "description",
+    "REFERENCE_ID": "doc",
+    "TRANSACTION_NET_AMOUNT": "amount",
+    "PARTIAL_BALANCE": "balance",
 }
 
-def apply_auto_classification(df: pd.DataFrame, rules):
-    if df.empty: return df
-    df = df.copy()
-    df["descricao_low"] = df["descricao"].fillna("").str.lower()
-    df["doc_low"] = df["doc"].fillna("").str.lower()
+# =========================
+# Importação (CSV/XLSX)
+# =========================
+def render_import():
+    st.subheader("📥 Importar Extrato (CSV/XLSX)")
+    st.info("Primeiro alvo: **Mercado Pago**. Depois adicionaremos outros bancos.")
 
-    for r in rules:
-        terms = r.get("contains", [])
-        terms_doc = r.get("in_doc", [])
-        cat = r.get("category", "")
-        sup = r.get("supplier", "")
+    dims = load_dim_tables()
+    companies = dims["companies"]
+    accounts = dims["accounts"]
+    rules = dims["rules"]
+    cats = dims["categories"]
+    sups = dims["suppliers"]
 
-        mask = False
-        for t in terms:
-            mask = mask | df["descricao_low"].str.contains(t, na=False)
-        for d in terms_doc:
-            mask = mask | df["doc_low"].str.contains(d, na=False)
+    # Selecionar empresa e conta
+    col1, col2, col3 = st.columns([1.2, 1, 1])
+    with col1:
+        company_name = st.selectbox("Empresa", companies["name"].tolist(), index=0)
+    company_row = companies[companies["name"] == company_name].iloc[0]
+    color_pill(company_row["name"], company_row["color"])
 
-        if cat:
-            df.loc[mask & (df["categoria"].isna() | (df["categoria"] == "")), "categoria"] = cat
-        if sup:
-            df.loc[mask & (df["fornecedor"].isna() | (df["fornecedor"] == "")), "fornecedor"] = sup
+    acc_opts = accounts[accounts["company_id"] == company_row["id"]]
+    with col2:
+        account_name = st.selectbox("Conta bancária", acc_opts["name"].tolist(), index=0)
+    account_row = acc_opts[acc_opts["name"] == account_name].iloc[0]
 
-        # saídas reconhecidas como tarifas/chargebacks não exigem match
-        df.loc[mask & (df["valor"] < 0) & (df["categoria"].isin(AUTO_NO_MATCH_CATS)), "status_match"] = "N/A"
+    with col3:
+        tolerancia = st.number_input("Tolerância (R$)", min_value=0.0, value=DEFAULT_TOLERANCIA, step=0.01)
 
-    df.drop(columns=["descricao_low","doc_low"], inplace=True)
-    return df
+    st.markdown("#### Arquivo do extrato")
+    file = st.file_uploader("Arraste o arquivo CSV ou XLSX", type=["csv", "xlsx"])
 
-def learn_rule_from_match(descricao: str, categoria: str, fornecedor: str):
-    desc_low = (descricao or "").strip().lower()
-    if not desc_low or not categoria: return None
-    tokens = re.findall(r"[a-zA-Z0-9]{4,}", desc_low)
-    if not tokens: return None
-    token = tokens[0]
-    return {"contains": [token], "in_doc": [], "category": categoria, "supplier": fornecedor or ""}
+    st.markdown("##### Mapeamento de colunas")
+    st.caption("Preset Mercado Pago sugerido; pode ajustar se o layout mudar.")
 
-# ==============================
-# UI Helpers
-# ==============================
-
-def pill(text, color="#334155", text_color="#fff"):
-    st.markdown(f"""
-        <span class="pill" style="background:{color};color:{text_color};padding:6px 10px;border-radius:999px;font-size:12px;margin-left:8px">{text}</span>
-    """, unsafe_allow_html=True)
-
-def header(title, company=None):
-    color = COMPANY_COLORS.get(company, None) if company else None
-    st.markdown(f"### {title}")
-    if company and color:
-        st.markdown(f"<div style='height:4px;background:{color};border-radius:4px;margin:-10px 0 10px 0;'></div>", unsafe_allow_html=True)
-
-# ==============================
-# Tema claro / Visual moderno
-# ==============================
-
-GLOBAL_CSS = """
-<style>
-:root{
-  --bg:#ffffff;
-  --surface:#f8fafc;
-  --card:#ffffff;
-  --text:#0f172a;
-  --muted:#64748b;
-  --border:#e5e7eb;
-  --primary:#0ea5e9;
-  --success:#16a34a;
-  --warning:#f59e0b;
-  --danger:#ef4444;
-  --radius:14px;
-  --shadow:0 10px 20px rgba(2,6,23,0.06);
-}
-html, body, [data-testid="stAppViewContainer"]{ background:var(--bg)!important; color:var(--text)!important; }
-[data-testid="stSidebar"]{ background:#ffffff!important; border-right:1px solid var(--border); }
-.stButton>button{ border-radius:12px!important; padding:8px 14px!important; border:1px solid var(--border)!important; box-shadow:var(--shadow)!important; }
-.stButton>button:hover{ transform:translateY(-1px); }
-.stSelectbox>div>div, .stTextInput>div>div, .stDateInput>div>div, .stNumberInput>div>div{
-  border-radius:10px!important; border:1px solid var(--border)!important; box-shadow:none!important;
-}
-.pill{ display:inline-block; padding:6px 10px; border-radius:999px; font-size:12px; color:#fff; }
-</style>
-"""
-
-# ==============================
-# Login simples (senha única)
-# ==============================
-
-def simple_login():
-    if "auth" not in st.session_state:
-        st.session_state.auth = False
-    if st.session_state.auth:
-        return True
-    with st.sidebar:
-        st.subheader("🔐 Acesso")
-        pwd = st.text_input("Senha única (temporário)", type="password", help="Definir auth melhor depois. Padrão: alivvia2025")
-        if st.button("Entrar"):
-            if pwd == "alivvia2025":
-                st.session_state.auth = True
-                st.success("Acesso liberado.")
-            else:
-                st.error("Senha incorreta.")
-    return st.session_state.auth
-
-# ==============================
-# Importação (CSV/XLSX + Mapeamento)
-# ==============================
-
-def importar_extrato_view():
-    st.sidebar.header("⚙️ Configurações rápidas")
-    empresa = st.sidebar.selectbox("Empresa", ["Alivvia", "JCA"])
-    conta = st.sidebar.selectbox("Conta bancária", ["Mercado Pago", "Banco do Brasil", "Itaú", "Outra"])
-    header("📥 Importar Extrato (CSV/XLSX)", empresa)
-
-    st.info("Primeiro alvo: **Mercado Pago**. Depois adicionamos outros bancos.", icon="ℹ️")
-
-    up = st.file_uploader("Selecione o arquivo (.csv ou .xlsx)", type=["csv", "xlsx"])
-
-    col_map_defaults = {
-        "data": "RELEASE_DATE",
-        "descricao": "TRANSACTION_TYPE",
-        "doc": "REFERENCE_ID",
-        "valor": "TRANSACTION_NET_AMOUNT",
-        "saldo": "PARTIAL_BALANCE",
-    }
-
-    if up is not None:
+    # tabela de mapeamento
+    if file is not None:
+        # Lê pequeno sample só para exibir colunas
         try:
-            if up.name.endswith(".csv"):
-                raw = pd.read_csv(up, dtype=str)
+            if file.name.lower().endswith(".csv"):
+                sample = pd.read_csv(file, nrows=5)
+                file.seek(0)
             else:
-                raw = pd.read_excel(up, dtype=str)
+                sample = pd.read_excel(file, nrows=5)
+                file.seek(0)
         except Exception as e:
-            st.error(f"Erro ao ler arquivo: {e}")
+            st.error(f"Falha ao ler arquivo: {e}")
             return
+        st.write("Colunas detectadas:", list(sample.columns))
+    else:
+        sample = None
 
-        st.write("Prévia do arquivo:")
-        st.dataframe(raw.head(30), use_container_width=True)
+    # UI para mapeamento
+    def pick(colname):
+        options = ["--"] + (list(sample.columns) if sample is not None else [])
+        default = "--"
+        if sample is not None and colname in MP_MAP:
+            # tentar achar por chave
+            if MP_MAP[colname] in sample.columns:
+                default = MP_MAP[colname]
+            elif colname in sample.columns:
+                default = colname
+        return st.selectbox(colname, options, index=options.index(default) if default in options else 0)
 
-        # Mapeamento de Colunas
-        st.subheader("Mapeamento de Colunas")
-        cols = list(raw.columns)
-        map_data = {}
-        c1, c2 = st.columns(2)
-        with c1:
-            map_data["data"] = st.selectbox("Campo interno: data", options=["(vazio)"] + cols, index=(cols.index(col_map_defaults["data"]) + 1) if col_map_defaults["data"] in cols else 0)
-            map_data["descricao"] = st.selectbox("Campo interno: descricao", options=["(vazio)"] + cols, index=(cols.index(col_map_defaults["descricao"]) + 1) if col_map_defaults["descricao"] in cols else 0)
-            map_data["doc"] = st.selectbox("Campo interno: doc", options=["(vazio)"] + cols, index=(cols.index(col_map_defaults["doc"]) + 1) if col_map_defaults["doc"] in cols else 0)
-        with c2:
-            map_data["valor"] = st.selectbox("Campo interno: valor (R$)", options=["(vazio)"] + cols, index=(cols.index(col_map_defaults["valor"]) + 1) if col_map_defaults["valor"] in cols else 0)
-            map_data["saldo"] = st.selectbox("Campo interno: saldo (R$)", options=["(vazio)"] + cols, index=(cols.index(col_map_defaults["saldo"]) + 1) if col_map_defaults["saldo"] in cols else 0)
+    with st.form("map_form"):
+        st.write("**Selecione as colunas do arquivo para cada campo interno:**")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1: m_date = pick("RELEASE_DATE")
+        with c2: m_desc = pick("TRANSACTION_TYPE")
+        with c3: m_doc  = pick("REFERENCE_ID")
+        with c4: m_amount = pick("TRANSACTION_NET_AMOUNT")
+        with c5: m_balance = pick("PARTIAL_BALANCE")
+        submitted = st.form_submit_button("Pré-visualizar e validar")
 
-        if st.button("Processar e Importar"):
-            tmp = pd.DataFrame()
-            for k, src in map_data.items():
-                if src != "(vazio)" and src in raw.columns:
-                    tmp[k] = raw[src].copy()
-                else:
-                    tmp[k] = ""
-
-            # normalizações
-            tmp["data"] = pd.to_datetime(tmp["data"], errors="coerce").dt.date
-            for col in ["valor", "saldo"]:
-                v = tmp[col].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-                tmp[col] = pd.to_numeric(v, errors="coerce").fillna(0.0)
-
-            # campos fixos
-            tmp["empresa"] = empresa
-            tmp["conta"] = conta
-            tmp["categoria"] = ""
-            tmp["fornecedor"] = ""
-            tmp["nf"] = ""
-            tmp["parcela"] = ""
-            tmp["datas_livres"] = [[] for _ in range(len(tmp))]
-            tmp["status_match"] = np.where(tmp["valor"] < 0, "Pendente", "N/A")  # só match em saídas
-            now = datetime.utcnow().isoformat()
-            tmp["created_at"] = now
-            tmp["updated_at"] = now
-            tmp["origem"] = "EXTRATO"
-
-            # gerar tx_id
-            tmp["tx_id"] = tmp.apply(lambda r: hashlib.md5(f"{empresa}-{conta}-{r['data']}-{r['descricao']}-{r['doc']}-{r['valor']}".encode("utf-8")).hexdigest(), axis=1)
-
-            # juntar com base
-            base = load_transactions()
-            before = len(base)
-            merged = pd.concat([base, tmp], ignore_index=True)
-            merged.drop_duplicates(subset=["tx_id"], keep="first", inplace=True)
-
-            # regras automáticas
-            rules = load_rules()
-            merged = apply_auto_classification(merged, rules)
-
-            save_transactions(merged)
-            st.success(f"Importação concluída. {len(merged) - before} novos lançamentos adicionados.")
-
-    # Export base completa (amostra)
-    st.divider()
-    base = load_transactions()
-    st.caption("Base atual (amostra)")
-    st.dataframe(base.tail(50), use_container_width=True)
-    st.download_button("⬇️ Exportar base completa (CSV)", data=base.to_csv(index=False).encode("utf-8"), file_name="transactions_base.csv", mime="text/csv")
-
-# ==============================
-# Lançamentos Manuais (Boletos/PIX/Transf.)
-# ==============================
-
-def lancamentos_view():
-    empresa = st.sidebar.selectbox("Empresa", ["Alivvia", "JCA"], key="empresa_lanc")
-    header("🧾 Lançamentos Manuais", empresa)
-
-    df = load_transactions()
-
-    st.subheader("Novo Lançamento")
-    with st.form("form_lanc"):
-        c1, c2, c3 = st.columns([1,1,1])
-        with c1:
-            data_l = st.date_input("Data", value=date.today())
-            valor_l = st.number_input("Valor (negativo=saída, positivo=entrada)", value=0.0, step=0.01, format="%.2f")
-        with c2:
-            conta_l = st.selectbox("Conta", ["Mercado Pago","Banco do Brasil","Itaú","Outra"])
-            doc_l = st.text_input("Doc/Referência", "")
-        with c3:
-            descricao_l = st.text_input("Descrição", "")
-
-        cats = load_categories()
-        sups = load_suppliers()
-
-        c4, c5, c6 = st.columns([1,1,1])
-        with c4:
-            categoria_l = st.selectbox("Categoria", options=cats + ["+ Adicionar nova..."])
-            if categoria_l == "+ Adicionar nova...":
-                nova = st.text_input("Nova categoria")
-                if nova:
-                    cats.append(nova); save_json(CATS_FILE, cats); categoria_l = nova
-        with c5:
-            fornecedor_l = st.selectbox("Fornecedor", options=sups + ["+ Adicionar novo..."])
-            if fornecedor_l == "+ Adicionar novo...":
-                novo = st.text_input("Novo fornecedor")
-                if novo:
-                    sups.append(novo); save_json(SUPP_FILE, sups); fornecedor_l = novo
-        with c6:
-            nf_l = st.text_input("NF (opcional, sai nos relatórios)","")
-            parcela_l = st.text_input("Parcela (ex: 1/3)","")
-
-        st.caption("Datas livres (ex.: vencimentos)")
-        d1, d2, d3 = st.columns(3)
-        dl1 = d1.date_input("Data 1", value=None, key="l_dl1")
-        dl2 = d2.date_input("Data 2", value=None, key="l_dl2")
-        dl3 = d3.date_input("Data 3", value=None, key="l_dl3")
-        datas_livres_l = [d for d in [dl1, dl2, dl3] if d]
-
-        submit = st.form_submit_button("💾 Salvar lançamento")
-        if submit:
-            now = datetime.utcnow().isoformat()
-            base = {
-                "empresa": empresa,
-                "conta": conta_l,
-                "data": data_l,
-                "descricao": descricao_l,
-                "doc": doc_l,
-                "valor": float(valor_l),
-                "saldo": 0.0,
-                "categoria": categoria_l or "",
-                "fornecedor": fornecedor_l or "",
-                "nf": nf_l or "",
-                "parcela": parcela_l or "",
-                "datas_livres": datas_livres_l,
-                "status_match": "Pendente" if float(valor_l) < 0 else "N/A",
-                "origem": "MANUAL",
-                "created_at": now,
-                "updated_at": now
-            }
-            # tx_id único p/ manuais
-            base["tx_id"] = hashlib.md5(f"{empresa}-{conta_l}-{data_l}-{descricao_l}-{doc_l}-{valor_l}-{uuid.uuid4()}".encode("utf-8")).hexdigest()
-
-            df2 = pd.concat([df, pd.DataFrame([base])], ignore_index=True)
-            save_transactions(df2)
-            st.success("Lançamento criado com sucesso.")
-
-    st.markdown("---")
-    st.subheader("Lançamentos Manuais - lista e edição")
-
-    cA, cB = st.columns(2)
-    with cA:
-        mostrarmes = st.checkbox("Mostrar apenas mês atual", value=True)
-    with cB:
-        so_man = st.checkbox("Somente origem MANUAL", value=True)
-
-    df = load_transactions()
-    mask = (df["empresa"] == empresa)
-    if so_man:
-        mask = mask & (df["origem"] == "MANUAL")
-    if mostrarmes:
-        hj = date.today()
-        mask = mask & (pd.to_datetime(df["data"]).dt.year == hj.year) & (pd.to_datetime(df["data"]).dt.month == hj.month)
-
-    lista = df[mask].copy().sort_values(by="data", ascending=False)
-    st.dataframe(lista[["data","descricao","valor","categoria","fornecedor","nf","parcela","doc","status_match","origem"]], use_container_width=True)
-
-    if not lista.empty:
-        options = [(f"{r.data} | {r.descricao} | R$ {r.valor:.2f}", r.tx_id) for r in lista.itertuples()]
-        chosen = st.selectbox("Selecionar para editar/excluir", options=options, format_func=lambda x: x[0])
-
-        if chosen:
-            _, txid = chosen
-            row = df[df["tx_id"] == txid].iloc[0]
-
-            st.write("**Editar Lançamento**")
-            with st.form("form_edit"):
-                d1, d2, d3 = st.columns(3)
-                with d1:
-                    e_data = st.date_input("Data", value=pd.to_datetime(row["data"]).date() if row["data"] else date.today())
-                    e_valor = st.number_input("Valor", value=float(row["valor"]), step=0.01, format="%.2f")
-                    e_conta = st.selectbox("Conta", ["Mercado Pago","Banco do Brasil","Itaú","Outra"],
-                                           index=(["Mercado Pago","Banco do Brasil","Itaú","Outra"].index(row["conta"]) if row["conta"] in ["Mercado Pago","Banco do Brasil","Itaú","Outra"] else 0))
-                with d2:
-                    e_doc = st.text_input("Doc/Referência", value=row["doc"])
-                    e_desc = st.text_input("Descrição", value=row["descricao"])
-                with d3:
-                    e_nf = st.text_input("NF", value=row["nf"])
-                    e_parc = st.text_input("Parcela", value=row["parcela"])
-
-                e_cat = st.selectbox("Categoria", options=load_categories(),
-                                     index=(load_categories().index(row["categoria"]) if row["categoria"] in load_categories() else 0))
-                e_sup = st.selectbox("Fornecedor", options=load_suppliers(),
-                                     index=(load_suppliers().index(row["fornecedor"]) if row["fornecedor"] in load_suppliers() else 0))
-
-                ok_save = st.form_submit_button("💾 Salvar alterações")
-                if ok_save:
-                    df.loc[df["tx_id"] == txid, ["data","valor","conta","doc","descricao","nf","parcela","categoria","fornecedor","updated_at"]] = [
-                        e_data, float(e_valor), e_conta, e_doc, e_desc, e_nf, e_parc, e_cat, e_sup, datetime.utcnow().isoformat()
-                    ]
-                    if float(e_valor) < 0 and df.loc[df["tx_id"]==txid,"status_match"].iloc[0] == "N/A":
-                        df.loc[df["tx_id"]==txid,"status_match"] = "Pendente"
-                    save_transactions(df)
-                    st.success("Alterações salvas.")
-
-            if st.button("🗑️ Excluir lançamento"):
-                df = df[df["tx_id"] != txid].copy()
-                save_transactions(df)
-                st.warning("Lançamento excluído.")
-
-# ==============================
-# Conciliação (Match somente saídas)
-# ==============================
-
-def conciliacao_view():
-    empresa = st.sidebar.selectbox("Empresa", ["Alivvia", "JCA"], key="empresa_conc")
-    header("🔗 Conciliação Bancária (somente saídas)", empresa)
-
-    df = load_transactions()
-    if df.empty:
-        st.info("Nenhum lançamento. Importe um extrato primeiro.")
+    if not file or not submitted:
         return
 
-    # Filtros
+    # Ler arquivo completo
+    try:
+        if file.name.lower().endswith(".csv"):
+            df = pd.read_csv(file)
+        else:
+            df = pd.read_excel(file)
+    except Exception as e:
+        st.error(f"Falha ao ler arquivo: {e}")
+        return
+
+    # Renomear para nosso padrão
+    rename_map = {}
+    if m_date != "--":   rename_map[m_date] = "date"
+    if m_desc != "--":   rename_map[m_desc] = "description"
+    if m_doc != "--":    rename_map[m_doc]  = "doc"
+    if m_amount != "--": rename_map[m_amount] = "amount"
+    if m_balance != "--":rename_map[m_balance] = "balance"
+    df = df.rename(columns=rename_map)
+
+    # Validar campos mínimos
+    missing = [c for c in ["date", "description", "doc", "amount"] if c not in df.columns]
+    if missing:
+        st.error(f"Colunas obrigatórias ausentes: {missing}")
+        return
+
+    # Normalização
+    df["date"] = df["date"].apply(to_date)
+    df["amount"] = df["amount"].apply(to_decimal)
+    if "balance" in df.columns:
+        df["balance"] = df["balance"].apply(to_decimal)
+    else:
+        df["balance"] = None
+    df["description"] = df["description"].fillna("").astype(str).str.strip()
+    df["doc"] = df["doc"].fillna("").astype(str).str.strip()
+
+    # Sugerir categoria/fornecedor pelas regras
+    cat_map = {r["id"]: r["name"] for _, r in cats.iterrows()}
+    sup_map = {r["id"]: r["name"] for _, r in sups.iterrows()}
+
+    df["category_id_sug"] = None
+    df["supplier_id_sug"] = None
+    for i, row in df.iterrows():
+        cat_id, sup_id = suggest_category_supplier(row["description"], row["doc"], rules)
+        df.at[i, "category_id_sug"] = cat_id
+        df.at[i, "supplier_id_sug"] = sup_id
+
+    # Apenas para preview na tela
+    df_preview = df.copy()
+    df_preview["category_sug"] = df_preview["category_id_sug"].map(cat_map)
+    df_preview["supplier_sug"] = df_preview["supplier_id_sug"].map(sup_map)
+    st.write("Pré-visualização (amostra):")
+    st.dataframe(df_preview.head(25), use_container_width=True)
+
+    # Construir hashes
+    comp_id = company_row["id"]
+    acc_id = account_row["id"]
+
+    rows = []
+    for _, r in df.iterrows():
+        date = r["date"]
+        desc = r["description"]
+        doc  = r["doc"]
+        amt  = r["amount"]
+        bal  = r.get("balance", None)
+        h = sha1_row([comp_id, acc_id, date, desc, doc, amt])
+        rows.append({
+            "company_id": comp_id,
+            "account_id": acc_id,
+            "date": date,
+            "description": desc,
+            "doc": doc,
+            "amount": amt,
+            "balance": bal,
+            "category_id": r["category_id_sug"],
+            "supplier_id": r["supplier_id_sug"],
+            "nf": None,
+            "parcela": None,
+            "free_dates": "[]",
+            "match_status": "N.A.",
+            "pay_status": "N.A.",
+            "origin": "EXTRATO",
+            "hash": h,
+            "created_by": "import",
+            "updated_by": "import",
+        })
+    df_up = pd.DataFrame(rows)
+
+    # Checar duplicidades (já existentes no banco)
+    with engine.begin() as con:
+        hs = tuple(df_up["hash"].unique().tolist())
+        if len(hs) == 1:
+            sql = text("select hash from transactions where hash = :h")
+            exists = pd.read_sql(sql, con, params={"h": hs[0]})
+        else:
+            sql = text(f"select hash from transactions where hash in :h")
+            exists = pd.read_sql(sql, con, params={"h": hs})
+
+    existing_hashes = set(exists["hash"].tolist()) if not exists.empty else set()
+    df_insert = df_up[~df_up["hash"].isin(existing_hashes)].copy()
+
     c1, c2, c3 = st.columns(3)
-    with c1:
-        status = st.selectbox("Status", ["Pendente", "Todos (saídas)"])
-    with c2:
-        dt_ini = st.date_input("Data inicial", value=None)
-    with c3:
-        dt_fim = st.date_input("Data final", value=None)
+    c1.metric("Total no arquivo", len(df_up))
+    c2.metric("Já existentes (ignorados)", len(existing_hashes))
+    c3.metric("Novos a inserir", len(df_insert))
 
-    c4, c5 = st.columns(2)
-    with c4:
-        cat_filtro = st.selectbox("Categoria (opcional)", options=["(todas)"] + load_categories())
-    with c5:
-        busca = st.text_input("Buscar por texto (descrição/doc)", "")
-
-    mask = (df["empresa"] == empresa) & (df["valor"] < 0)
-    if status == "Pendente":
-        mask = mask & (df["status_match"] == "Pendente")
-    if dt_ini:
-        mask = mask & (pd.to_datetime(df["data"]) >= pd.to_datetime(dt_ini))
-    if dt_fim:
-        mask = mask & (pd.to_datetime(df["data"]) <= pd.to_datetime(dt_fim))
-    if cat_filtro != "(todas)":
-        mask = mask & (df["categoria"] == cat_filtro)
-    if busca:
-        low = busca.lower()
-        mask = mask & (df["descricao"].fillna("").str.lower().str.contains(low) |
-                       df["doc"].fillna("").str.lower().str.contains(low))
-
-    view = df[mask].copy().sort_values(by=["data"], ascending=False)
-    view["nf_view"] = view["nf"].apply(lambda x: "S/NF" if (pd.isna(x) or str(x).strip()=="") else str(x).strip())
-
-    st.write(f"**{len(view)}** lançamentos filtrados.")
-    st.dataframe(view[["data", "descricao", "doc", "valor", "categoria", "fornecedor", "nf_view", "parcela", "status_match"]].head(300), use_container_width=True)
-
-    st.download_button(
-        "⬇️ Exportar Conciliação (CSV - filtro atual)",
-        data=view.to_csv(index=False).encode("utf-8"),
-        file_name="conciliacao_filtro.csv",
-        mime="text/csv"
-    )
-
-    st.subheader("Fazer Match")
-    st.caption("Selecione um lançamento de saída e preencha os campos.")
-
-    options = [(f"{r.data} | {r.descricao} | R$ {r.valor:.2f}", r.tx_id) for r in view.itertuples()]
-    if not options:
-        st.info("Nada para conciliar no filtro atual.")
+    if len(df_insert) == 0:
+        st.warning("Nenhum novo lançamento para inserir (arquivo já importado).")
         return
 
-    selected = st.selectbox("Lançamento", options=options, format_func=lambda x: x[0])
-    if selected:
-        _, tx_id = selected
-        row = df[df["tx_id"] == tx_id].iloc[0]
+    if st.button("✅ Confirmar importação (gravar no banco)", type="primary"):
+        # Inserir em batch
+        inserted = 0
+        with engine.begin() as con:
+            for _, r in df_insert.iterrows():
+                con.execute(text("""
+                    insert into transactions
+                    (id, company_id, account_id, date, description, doc, amount, balance,
+                     category_id, supplier_id, nf, parcela, free_dates, match_status, pay_status, pay_date,
+                     origin, hash, created_by, updated_by)
+                    values (gen_random_uuid(), :company_id, :account_id, :date, :description, :doc, :amount, :balance,
+                            :category_id, :supplier_id, :nf, :parcela, :free_dates::jsonb, :match_status, :pay_status, :pay_date,
+                            :origin, :hash, :created_by, :updated_by)
+                    on conflict (hash) do nothing
+                """), {
+                    **{k: r[k] for k in ["company_id","account_id","date","description","doc","amount","balance",
+                                         "category_id","supplier_id","nf","parcela","match_status","pay_status",
+                                         "origin","hash","created_by","updated_by"]},
+                    "free_dates": r["free_dates"],
+                    "pay_date": None,
+                })
+                inserted += 1
+        refresh_dims()  # dimensões podem mudar (regras futuras)
+        st.success(f"Importação concluída. Inseridos: {inserted} novos.")
+        st.balloons()
 
-        cats = load_categories()
-        sups = load_suppliers()
+# =========================
+# Lançamentos (CRUD simples)
+# =========================
+def render_lancamentos():
+    st.subheader("🧾 Lançamentos (manuais)")
+    dims = load_dim_tables()
+    companies, cats, sups = dims["companies"], dims["categories"], dims["suppliers"]
 
-        st.write("**Detalhes do lançamento**")
+    with st.expander("➕ Novo lançamento", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
-        with c1: st.write("Data:", row["data"])
-        with c2: st.write("Descrição:", row["descricao"])
-        with c3: st.write("Doc:", row["doc"])
-        with c4: st.write("Valor (R$):", f"{row['valor']:.2f}")
+        with c1:
+            comp = st.selectbox("Empresa", companies["name"].tolist())
+            comp_id = companies.loc[companies["name"]==comp, "id"].iloc[0]
+        with c2:
+            date = st.date_input("Data", dt.date.today())
+        with c3:
+            valor = st.number_input("Valor (positivo=entrada, negativo=saída)", step=0.01, format="%.2f")
+        with c4:
+            nf = st.text_input("NF (opcional)")
 
-        st.markdown("---")
-        st.write("**Preencha o Match**")
+        c5, c6, c7, c8 = st.columns(4)
+        with c5: descricao = st.text_input("Descrição")
+        with c6: doc = st.text_input("Documento/Ref.")
+        with c7: cat_name = st.selectbox("Categoria", cats["name"].tolist())
+        with c8: sup_name = st.selectbox("Fornecedor (opcional)", ["--"] + sups["name"].tolist())
 
-        col1, col2 = st.columns([2,1])
-        with col1:
-            categoria = st.selectbox("Categoria", options=cats + ["+ Adicionar nova..."], index=(cats.index(row["categoria"]) if row["categoria"] in cats else 0) if cats else 0)
-            if categoria == "+ Adicionar nova...":
-                nova = st.text_input("Nova categoria")
-                if nova:
-                    cats.append(nova); save_json(CATS_FILE, cats); categoria = nova
+        c9, c10, c11 = st.columns(3)
+        with c9: parcela = st.text_input("Parcela (ex.: 1/3)")
+        with c10: pay_status = st.selectbox("Status", ["Previsto","Pago","Estornado","N.A."], index=1 if valor<0 else 3)
+        with c11: pay_date = st.date_input("Data Pagto (se pago)", value=dt.date.today() if pay_status=="Pago" else None)
 
-            fornecedor = st.selectbox("Fornecedor", options=sups + ["+ Adicionar novo..."], index=(sups.index(row["fornecedor"]) if row["fornecedor"] in sups else 0) if sups else 0)
-            if fornecedor == "+ Adicionar novo...":
-                novo = st.text_input("Novo fornecedor")
-                if novo:
-                    sups.append(novo); save_json(SUPP_FILE, sups); fornecedor = novo
-        with col2:
-            nf = st.text_input("NF (opcional, sai no relatório)", value=row["nf"] or "")
-            parcela = st.text_input("Parcela (ex: 1/3)", value=row["parcela"] or "")
+        if st.button("Salvar lançamento"):
+            cat_id = cats.loc[cats["name"]==cat_name, "id"].iloc[0]
+            sup_id = None
+            if sup_name != "--":
+                sup_id = sups.loc[sups["name"]==sup_name, "id"].iloc[0]
+            # conta opcional (None)
+            h = sha1_row([comp_id, None, date, descricao, doc, valor])
+            with engine.begin() as con:
+                con.execute(text("""
+                    insert into transactions
+                    (id, company_id, account_id, date, description, doc, amount, balance,
+                     category_id, supplier_id, nf, parcela, free_dates, match_status, pay_status, pay_date,
+                     origin, hash, created_by, updated_by)
+                    values (gen_random_uuid(), :company_id, null, :date, :description, :doc, :amount, null,
+                            :category_id, :supplier_id, :nf, :parcela, '[]'::jsonb, 'N.A.', :pay_status, :pay_date,
+                            'MANUAL', :hash, 'manual', 'manual')
+                    on conflict (hash) do nothing
+                """), {
+                    "company_id": comp_id, "date": date, "description": descricao, "doc": doc, "amount": valor,
+                    "category_id": cat_id, "supplier_id": sup_id, "nf": nf, "parcela": parcela,
+                    "pay_status": pay_status, "pay_date": pay_date if pay_status=="Pago" else None, "hash": h
+                })
+            st.success("Lançamento salvo")
 
-        st.write("**Datas livres (ex: vencimentos)**")
-        dcol1, dcol2, dcol3 = st.columns(3)
-        d1 = dcol1.date_input("Data 1", value=None, key="dl1")
-        d2 = dcol2.date_input("Data 2", value=None, key="dl2")
-        d3 = dcol3.date_input("Data 3", value=None, key="dl3")
-        datas_livres = [d for d in [d1, d2, d3] if d]
+    # Lista com filtros
+    st.markdown("### Lista")
+    colf1, colf2, colf3, colf4, colf5 = st.columns([1,1,1,1,2])
+    with colf1:
+        emp = st.selectbox("Empresa", ["Todas"] + companies["name"].tolist(), index=0)
+    with colf2:
+        dt_ini = st.date_input("De", dt.date.today() - dt.timedelta(days=30))
+    with colf3:
+        dt_fim = st.date_input("Até", dt.date.today())
+    with colf4:
+        cat_filter = st.selectbox("Categoria", ["Todas"] + cats["name"].tolist(), index=0)
+    with colf5:
+        q = st.text_input("Busca (descrição/doc)", "")
 
-        cA, cB, cC = st.columns(3)
-        with cA:
-            if st.button("✅ Salvar Match"):
-                df.loc[df["tx_id"] == tx_id, ["categoria","fornecedor","nf","parcela","datas_livres","status_match","updated_at"]] = [
-                    categoria, fornecedor, nf, parcela, datas_livres, "Conciliado", datetime.utcnow().isoformat()
-                ]
-                save_transactions(df)
-                # aprendizado
-                rule = learn_rule_from_match(row["descricao"], categoria, fornecedor)
-                if rule:
-                    rules = load_rules()
-                    rules.insert(0, rule)
-                    save_json(RULES_FILE, rules)
-                st.success("Match salvo e regra aprendida (quando possível).")
-        with cB:
-            if st.button("✏️ Editar (reabrir) Match"):
-                df.loc[df["tx_id"] == tx_id, ["status_match","updated_at"]] = ["Pendente", datetime.utcnow().isoformat()]
-                save_transactions(df)
-                st.warning("Match reaberto para edição.")
-        with cC:
-            if st.button("↩️ Desfazer (limpar campos)"):
-                df.loc[df["tx_id"] == tx_id, ["categoria","fornecedor","nf","parcela","datas_livres","status_match","updated_at"]] = [
-                    "", "", "", "", [], "Pendente", datetime.utcnow().isoformat()
-                ]
-                save_transactions(df)
-                st.info("Match desfeito.")
+    sql = """
+        select t.id, c.name as empresa, t.date, t.description as descricao, t.doc,
+               t.amount as valor, coalesce(cat.name,'') as categoria,
+               coalesce(s.name,'') as fornecedor, coalesce(t.nf,'S/NF') as nf,
+               coalesce(t.parcela,'') as parcela, t.match_status, t.pay_status
+        from transactions t
+        join companies c on c.id=t.company_id
+        left join categories cat on cat.id=t.category_id
+        left join suppliers s on s.id=t.supplier_id
+        where t.date between :dini and :dfim
+    """
+    params = {"dini": dt_ini, "dfim": dt_fim}
+    if emp != "Todas":
+        sql += " and c.name = :emp"
+        params["emp"] = emp
+    if cat_filter != "Todas":
+        sql += " and cat.name = :cat"
+        params["cat"] = cat_filter
+    if q:
+        sql += " and (lower(t.description) like :q or lower(t.doc) like :q)"
+        params["q"] = f"%{q.lower()}%"
+    sql += " order by t.date desc limit 500"
+    with engine.begin() as con:
+        df = pd.read_sql(text(sql), con, params=params)
+    st.dataframe(df, use_container_width=True, height=420)
 
-# ==============================
-# Relatórios (DRE + Contábil)
-# ==============================
+    # Export do filtro atual
+    if not df.empty:
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Exportar (CSV – filtro atual)", data=csv, file_name="lancamentos.csv", mime="text/csv")
 
-def relatorios_view():
-    empresa = st.sidebar.selectbox("Empresa", ["Alivvia", "JCA"], key="empresa_rep")
-    header("📊 Relatórios", empresa)
+# =========================
+# Conciliação
+# =========================
+def render_conciliacao():
+    st.subheader("🔗 Conciliação (somente saídas)")
 
-    df = load_transactions()
-    if df.empty:
-        st.info("Nenhum lançamento. Importe um extrato primeiro.")
-        return
+    dims = load_dim_tables()
+    companies, cats, sups = dims["companies"], dims["categories"], dims["suppliers"]
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ano = st.number_input("Ano", min_value=2020, max_value=2100, value=datetime.now().year)
-    with c2:
-        mes = st.number_input("Mês", min_value=1, max_value=12, value=datetime.now().month)
-    with c3:
-        st.write("Tolerância de match:", f"R$ {TOLERANCIA_MATCH:.2f}")
-        pill(f"Empresa: {empresa}", COMPANY_COLORS[empresa])
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        emp = st.selectbox("Empresa", companies["name"].tolist())
+    with col2:
+        dt_ini = st.date_input("De", dt.date.today() - dt.timedelta(days=30))
+    with col3:
+        dt_fim = st.date_input("Até", dt.date.today())
+    with col4:
+        tol = st.number_input("Tolerância (R$)", min_value=0.0, value=DEFAULT_TOLERANCIA, step=0.01)
 
-    dfE = df[(df["empresa"] == empresa) &
-             (pd.to_datetime(df["data"]).dt.year == ano) &
-             (pd.to_datetime(df["data"]).dt.month == mes)].copy()
+    # Saídas pendentes
+    sql = """
+    select t.id, t.date, t.description as descricao, t.doc, t.amount as valor,
+           coalesce(cat.name,'') as categoria, coalesce(s.name,'') as fornecedor,
+           coalesce(t.nf,'S/NF') as nf, coalesce(t.parcela,'') as parcela
+    from transactions t
+    join companies c on c.id=t.company_id
+    left join categories cat on cat.id=t.category_id
+    left join suppliers s on s.id=t.supplier_id
+    where c.name=:emp
+      and t.date between :dini and :dfim
+      and t.amount < 0
+      and (t.match_status='Pendente' or t.match_status='N.A.')
+    order by t.date asc
+    """
+    with engine.begin() as con:
+        pend = pd.read_sql(text(sql), con, params={"emp": emp, "dini": dt_ini, "dfim": dt_fim})
+    st.write("Pendentes (saídas):", len(pend))
+    st.dataframe(pend, use_container_width=True, height=360)
 
-    # ---------- DRE ----------
-    st.subheader("DRE (mês)")
+    with st.expander("Fazer Match (uma saída)"):
+        row_id = st.text_input("ID do lançamento (copie da lista acima)")
+        c1, c2, c3 = st.columns(3)
+        with c1: cat_name = st.selectbox("Categoria", cats["name"].tolist())
+        with c2: sup_name = st.selectbox("Fornecedor", ["--"] + sups["name"].tolist())
+        with c3: nf = st.text_input("NF (opcional)")
 
-    # Consolidar ENTRADAS diárias que são repasse marketplace
-    repasse_mask = (dfE["categoria"] == "Receita > Vendas (repasse marketplace)") & (dfE["valor"] > 0)
-    entradas_por_dia = dfE.loc[repasse_mask].groupby(pd.to_datetime(dfE.loc[repasse_mask, "data"]))["valor"].sum()
-    receita_bruta = float(entradas_por_dia.sum())
+        c4, c5 = st.columns(2)
+        with c4: parcela = st.text_input("Parcela (ex.: 1/3)")
+        with c5: datas_livres = st.text_input("Datas livres (ex.: 13/10, 15/11)")
 
-    devol = dfE.loc[dfE["categoria"] == "Receita > Estorno/Devolução","valor"].sum()
-    receita_liq = receita_bruta + devol  # devoluções geralmente negativas → somar ajusta
+        if st.button("✅ Match"):
+            if not row_id:
+                st.error("Informe o ID do lançamento.")
+            else:
+                cat_id = cats.loc[cats["name"]==cat_name, "id"].iloc[0]
+                sup_id = None
+                if sup_name != "--":
+                    sup_id = sups.loc[sups["name"]==sup_name, "id"].iloc[0]
 
-    despesas = dfE[dfE["valor"] < 0].groupby("categoria", dropna=False)["valor"].sum().sort_values()
-    st.write(f"**Receita Bruta (repasse consolidado/dia):** R$ {receita_bruta:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-    st.write(f"**(-) Devoluções:** R$ {devol:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-    st.write(f"**= Receita Líquida:** R$ {receita_liq:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+                # validação mínima: saídas
+                with engine.begin() as con:
+                    row = con.execute(text("select amount from transactions where id=:id"), {"id": row_id}).fetchone()
+                    if row is None:
+                        st.error("ID não encontrado.")
+                        return
+                    if float(row[0]) >= 0:
+                        st.error("Só conciliamos saídas (valor negativo).")
+                        return
 
-    st.write("**(-) Despesas por Categoria:**")
-    if not despesas.empty:
-        st.dataframe(despesas.reset_index().rename(columns={"valor":"Total (R$)"}), use_container_width=True)
-    total_desp = despesas.sum()
-    resultado = receita_liq + total_desp
-    st.write(f"**= Resultado do Período:** R$ {resultado:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+                    # atualizar
+                    free_dates_json = "[]"
+                    if datas_livres.strip():
+                        # salva como texto de string; validação simplificada
+                        arr = [x.strip() for x in datas_livres.split(",")]
+                        free_dates_json = pd.Series(arr).to_json(orient="values")
 
-    # ---------- Relatório Contábil ----------
-    st.subheader("Relatório Contábil (Diário/Mensal)")
+                    con.execute(text("""
+                        update transactions
+                        set category_id=:cat, supplier_id=:sup, nf=:nf, parcela=:parc,
+                            free_dates=:fd::jsonb, match_status='Conciliado', updated_by='match'
+                        where id=:id
+                    """), {"cat": cat_id, "sup": sup_id, "nf": nf if nf else None,
+                           "parc": parcela if parcela else None, "fd": free_dates_json, "id": row_id})
+                st.success("Match aplicado.")
 
-    rep = dfE.copy()
+    # Exportar pendências (opcional)
+    if not pend.empty:
+        csv = pend.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Exportar pendências (CSV – filtro atual)", data=csv, file_name="pendencias_conc.csv", mime="text/csv")
 
-    # NF: exibir "S/NF" quando vazio
-    rep["nf_out"] = rep["nf"].apply(lambda x: "S/NF" if (pd.isna(x) or str(x).strip() == "") else str(x).strip())
+# =========================
+# Relatórios
+# =========================
+def render_relatorios():
+    st.subheader("📊 Relatórios (em tela)")
 
-    # Destino (categoria/fornecedor)
-    rep["destino"] = rep.apply(lambda r: f"{r['categoria'] or ''} | {r['fornecedor'] or ''}".strip(" |"), axis=1)
+    dims = load_dim_tables()
+    companies, cats = dims["companies"], dims["categories"]
 
-    # Colunas Entrada/Saída
-    rep["Entrada"] = rep["valor"].apply(lambda v: v if v > 0 else 0.0)
-    rep["Saída"] = rep["valor"].apply(lambda v: abs(v) if v < 0 else 0.0)
+    col1, col2 = st.columns(2)
+    with col1:
+        emp = st.selectbox("Empresa", companies["name"].tolist())
+    with col2:
+        ref_mes = st.date_input("Mês da DRE", dt.date.today().replace(day=1))
 
-    # Ordenar e saldo acumulado (por mês/empresa)
-    rep = rep.sort_values(by=["data", "descricao"])
-    rep["Saldo Acumulado"] = rep["valor"].cumsum()
-
-    # Consolidar ENTRADAS por dia para contábil
-    entradas = rep[rep["categoria"] == "Receita > Vendas (repasse marketplace)"].copy()
-    saidas = rep[rep["categoria"] != "Receita > Vendas (repasse marketplace)"].copy()
-
-    if not entradas.empty:
-        ent_group = entradas.groupby("data", as_index=False).agg({"valor":"sum"})
-        ent_group["descricao"] = "Repasse marketplace (consolidado)"
-        ent_group["doc"] = ""
-        ent_group["fornecedor"] = ""
-        ent_group["categoria"] = "Receita > Vendas (repasse marketplace)"
-        ent_group["nf_out"] = "S/NF"
-        ent_group["destino"] = "Receita > Vendas (repasse marketplace)"
-        ent_group["Entrada"] = ent_group["valor"].apply(lambda v: v if v > 0 else 0.0)
-        ent_group["Saída"] = 0.0
-        entradas_fmt = ent_group[["data","descricao","destino","Entrada","Saída","nf_out","doc","valor","categoria","fornecedor","empresa"]].copy()
+    # DRE do mês
+    mes_ini = ref_mes.replace(day=1)
+    if mes_ini.month == 12:
+        mes_fim = mes_ini.replace(year=mes_ini.year+1, month=1)
     else:
-        entradas_fmt = pd.DataFrame(columns=["data","descricao","destino","Entrada","Saída","nf_out","doc","valor","categoria","fornecedor","empresa"])
+        mes_fim = mes_ini.replace(month=mes_ini.month+1)
 
-    saidas["Entrada"] = 0.0
-    saidas_fmt = saidas[["data","descricao","destino","Entrada","Saída","nf_out","doc","valor","categoria","fornecedor","empresa"]].copy()
+    with engine.begin() as con:
+        # Receita Bruta (repasse marketplace) – entradas > 0
+        rec_bruta = pd.read_sql(text("""
+            select coalesce(sum(t.amount),0) as valor
+            from transactions t
+            join companies c on c.id=t.company_id
+            join categories cat on cat.id=t.category_id
+            where c.name=:emp
+              and t.date>=:ini and t.date<:fim
+              and t.amount>0
+              and cat.name='Receita > Vendas (repasse marketplace)'
+        """), con, params={"emp": emp, "ini": mes_ini, "fim": mes_fim}).iloc[0]["valor"]
 
-    contabil = pd.concat([entradas_fmt, saidas_fmt], ignore_index=True).sort_values(by=["data","descricao"])
-    contabil["Saldo Acumulado"] = contabil["valor"].cumsum()
+        devol = pd.read_sql(text("""
+            select coalesce(sum(t.amount),0) as valor
+            from transactions t
+            join companies c on c.id=t.company_id
+            join categories cat on cat.id=t.category_id
+            where c.name=:emp
+              and t.date>=:ini and t.date<:fim
+              and cat.name='Receita > Estorno/Devolução'
+        """), con, params={"emp": emp, "ini": mes_ini, "fim": mes_fim}).iloc[0]["valor"]
 
-    contabil_out = contabil.rename(columns={
-        "data":"Data",
-        "descricao":"Movimentação/Descrição",
-        "destino":"Destino (categoria/fornecedor)",
-        "nf_out":"NF",
-        "empresa":"Empresa"
-    })[["Data","Movimentação/Descrição","Destino (categoria/fornecedor)","Entrada","Saída","NF","Saldo Acumulado","Empresa"]]
+        despesas = pd.read_sql(text("""
+            select cat.name as categoria, sum(t.amount) as total
+            from transactions t
+            join companies c on c.id=t.company_id
+            left join categories cat on cat.id=t.category_id
+            where c.name=:emp
+              and t.date>=:ini and t.date<:fim
+              and t.amount<0
+            group by cat.name
+            order by cat.name
+        """), con, params={"emp": emp, "ini": mes_ini, "fim": mes_fim})
 
-    st.dataframe(contabil_out, use_container_width=True)
+    rec_liq = float(rec_bruta) + float(devol) + 0.0  # devoluções tipicamente negativas
+    desp_total = float(despesas["total"].sum() if not despesas.empty else 0.0)
+    resultado = rec_liq + desp_total
 
-    st.download_button(
-        "⬇️ Exportar DRE (CSV)",
-        data=despesas.reset_index().to_csv(index=False).encode("utf-8"),
-        file_name=f"DRE_{empresa}_{ano}-{mes:02d}.csv",
-        mime="text/csv"
-    )
-    st.download_button(
-        "⬇️ Exportar Relatório Contábil (CSV)",
-        data=contabil_out.to_csv(index=False).encode("utf-8"),
-        file_name=f"RELATORIO_CONTABIL_{empresa}_{ano}-{mes:02d}.csv",
-        mime="text/csv"
-    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Receita Bruta", f"R$ {rec_bruta:,.2f}")
+    c2.metric("Devoluções", f"R$ {devol:,.2f}")
+    c3.metric("Despesas (soma)", f"R$ {desp_total:,.2f}")
+    c4.metric("Resultado", f"R$ {resultado:,.2f}")
 
-# ==============================
-# Configurações (Categorias/Fornecedores/Regras)
-# ==============================
-
-def configuracoes_view():
-    header("🔧 Configurações")
-    # categorias
-    cats = load_categories()
-    st.write("**Categorias**")
-    new_cat = st.text_input("Adicionar categoria")
-    if st.button("Adicionar categoria"):
-        if new_cat and new_cat not in cats:
-            cats.append(new_cat); save_json(CATS_FILE, cats); st.success("Categoria adicionada.")
-    if st.button("Salvar categorias"):
-        save_json(CATS_FILE, [c for c in cats if c]); st.success("Categorias salvas.")
-    st.dataframe(pd.DataFrame({"categoria": cats}), use_container_width=True)
-
-    st.markdown("---")
-    st.write("**Fornecedores**")
-    sups = load_suppliers()
-    new_sup = st.text_input("Adicionar fornecedor")
-    if st.button("Adicionar fornecedor"):
-        if new_sup and new_sup not in sups:
-            sups.append(new_sup); save_json(SUPP_FILE, sups); st.success("Fornecedor adicionado.")
-    if st.button("Salvar fornecedores"):
-        save_json(SUPP_FILE, [s for s in sups if s]); st.success("Fornecedores salvos.")
-    st.dataframe(pd.DataFrame({"fornecedor": sups}), use_container_width=True)
+    with st.expander("Despesas por categoria (mês)"):
+        st.dataframe(despesas, use_container_width=True)
 
     st.markdown("---")
-    st.write("**Regras automáticas (aprendizado)**")
-    rules = load_rules()
-    st.caption("As regras são aprendidas ao salvar matches. Você pode revisar/exportar abaixo.")
-    st.json(rules)
+    st.markdown("### Histórico (Últimos 6 meses)")
+    dt_ref = dt.date.today() - dt.timedelta(days=180)
+    with engine.begin() as con:
+        hist = pd.read_sql(text("""
+            select to_char(date_trunc('month', t.date), 'YYYY-MM') as mes,
+                   sum(case when t.amount>0 then t.amount else 0 end) as entradas,
+                   sum(case when t.amount<0 then t.amount else 0 end) as saidas
+            from transactions t
+            join companies c on c.id=t.company_id
+            where c.name=:emp
+              and t.date>=:ini
+            group by 1
+            order by 1
+        """), con, params={"emp": emp, "ini": dt_ref})
+    st.dataframe(hist, use_container_width=True)
 
-    st.markdown("---")
-    st.write("**Manutenção de base**")
-    base = load_transactions()
-    st.download_button("⬇️ Baixar base completa (CSV)", data=base.to_csv(index=False).encode("utf-8"), file_name="transactions_base.csv", mime="text/csv")
-    if st.button("Limpar base (cuidado!)"):
-        TX_FILE.unlink(missing_ok=True)
-        st.warning("Base apagada. Reimporte seus extratos.")
+    # Export do histórico
+    if not hist.empty:
+        st.download_button("⬇️ Exportar histórico (CSV – filtro atual)",
+                           data=hist.to_csv(index=False).encode("utf-8"),
+                           file_name="historico_6m.csv", mime="text/csv")
 
-# ==============================
-# Main
-# ==============================
+# =========================
+# Configurações (Categorias, Fornecedores, Regras)
+# =========================
+def render_config():
+    st.subheader("⚙️ Configurações")
+    dims = load_dim_tables()
+    cats, sups, rules = dims["categories"], dims["suppliers"], dims["rules"]
 
+    tab1, tab2, tab3 = st.tabs(["Categorias", "Fornecedores", "Regras (auto)"])
+
+    with tab1:
+        st.write("Categorias ativas:", len(cats))
+        st.dataframe(cats, use_container_width=True, height=320)
+        with st.form("new_cat"):
+            name = st.text_input("Nova categoria")
+            if st.form_submit_button("Adicionar") and name.strip():
+                with engine.begin() as con:
+                    con.execute(text("insert into categories(id,name) values (gen_random_uuid(), :n) on conflict(name) do nothing"),
+                                {"n": name.strip()})
+                refresh_dims()
+                st.success("Categoria adicionada")
+
+    with tab2:
+        st.write("Fornecedores ativos:", len(sups))
+        st.dataframe(sups, use_container_width=True, height=320)
+        with st.form("new_sup"):
+            name = st.text_input("Novo fornecedor")
+            if st.form_submit_button("Adicionar") and name.strip():
+                with engine.begin() as con:
+                    con.execute(text("insert into suppliers(id,name) values (gen_random_uuid(), :n) on conflict(name) do nothing"),
+                                {"n": name.strip()})
+                refresh_dims()
+                st.success("Fornecedor adicionado")
+
+    with tab3:
+        st.write("Regras de auto-classificação (por token):")
+        st.dataframe(rules, use_container_width=True, height=320)
+        with st.form("new_rule"):
+            token = st.text_input("Token (palavra a buscar na descrição/doc)")
+            colr1, colr2 = st.columns(2)
+            with colr1:
+                cat_name = st.selectbox("Categoria", cats["name"].tolist())
+            with colr2:
+                sup_name = st.selectbox("Fornecedor (opcional)", ["--"] + sups["name"].tolist())
+            if st.form_submit_button("Adicionar regra") and token.strip():
+                cat_id = cats.loc[cats["name"]==cat_name, "id"].iloc[0]
+                sup_id = None
+                if sup_name != "--":
+                    sup_id = sups.loc[sups["name"]==sup_name, "id"].iloc[0]
+                with engine.begin() as con:
+                    con.execute(text("""
+                        insert into rules(id, token, category_id, supplier_id)
+                        values (gen_random_uuid(), :t, :c, :s)
+                    """), {"t": token.strip().lower(), "c": cat_id, "s": sup_id})
+                refresh_dims()
+                st.success("Regra adicionada")
+
+# =========================
+# Barra lateral / login simples (senha única)
+# =========================
+def sidebar_login():
+    st.sidebar.header("🔐 Acesso")
+    pwd = st.sidebar.text_input("Senha Única (temporário)", type="password")
+    ok = st.sidebar.button("Entrar")
+    if ok and pwd:
+        st.session_state["auth_ok"] = True  # placeholder simples
+    # Para POC, consideramos liberado (já que app é interno)
+    st.session_state.setdefault("auth_ok", True)
+    if st.session_state["auth_ok"]:
+        st.sidebar.success("Acesso liberado.")
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("🧭 Navegação")
+    return st.sidebar.radio("Ir para", ["Importar", "Lançamentos", "Conciliação", "Relatórios", "Configurações"])
+
+# =========================
+# App
+# =========================
 def main():
-    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+    page = sidebar_login()
+    st.markdown(f"<div style='text-align:right;color:#999'>Versão {APP_VERSION}</div>", unsafe_allow_html=True)
 
-    if not simple_login():
-        st.stop()
-
-    with st.sidebar:
-        st.header("🧭 Navegação")
-        page = st.radio("Ir para", ["Importar Extrato", "Lançamentos", "Conciliação", "Relatórios", "Configurações"])
-
-    if page == "Importar Extrato":
-        importar_extrato_view()
+    if page == "Importar":
+        render_import()
     elif page == "Lançamentos":
-        lancamentos_view()
+        render_lancamentos()
     elif page == "Conciliação":
-        conciliacao_view()
+        render_conciliacao()
     elif page == "Relatórios":
-        relatorios_view()
-    else:
-        configuracoes_view()
+        render_relatorios()
+    elif page == "Configurações":
+        render_config()
 
 if __name__ == "__main__":
     main()
