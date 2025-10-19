@@ -1,4 +1,4 @@
-﻿# v0.2.7j - wheels e compatível com Python 3.12
+﻿# v0.2.7k - compatível com Python 3.13 + somente wheels
 --prefer-binary
 --only-binary=:all:
 
@@ -6,5 +6,5 @@ streamlit==1.38.0
 numpy==2.1.2
 pandas==2.2.3
 SQLAlchemy==2.0.31
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.11
 openpyxl==3.1.5
