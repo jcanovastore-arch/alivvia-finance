@@ -1,8 +1,9 @@
-﻿# v0.2.7k - compatível com Python 3.13 + somente wheels
+﻿# v0.2.7l - compatível Python 3.13 + somente wheels + rich compatível
 --prefer-binary
 --only-binary=:all:
 
 streamlit==1.38.0
+rich==13.9.4
 numpy==2.1.2
 pandas==2.2.3
 SQLAlchemy==2.0.31

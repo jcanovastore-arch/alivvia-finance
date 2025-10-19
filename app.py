@@ -4,6 +4,7 @@
 # Observação: exportação é sempre OPCIONAL e reflete o filtro atual na tela.
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 
 import os
