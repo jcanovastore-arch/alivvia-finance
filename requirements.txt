@@ -1,6 +1,9 @@
-﻿# v0.2.7f
+﻿# v0.2.7i - força wheels (evita compilar pandas/numpy no Cloud)
+--prefer-binary
+--only-binary=:all:
+
 streamlit==1.38.0
-pandas==2.2.2
+pandas==2.2.3
 numpy==1.26.4
 SQLAlchemy==2.0.31
 psycopg2-binary==2.9.9
